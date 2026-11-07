@@ -187,26 +187,81 @@ async function checkToken(address) {
   return msg;
 }
 
+// ---------- Database (Supabase) ----------
+async function db(fn, body) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SECRET_KEY;
+  if (!url || !key) return null;
+  const headers = { apikey: key, "Content-Type": "application/json" };
+  if (!key.startsWith("sb_")) headers.Authorization = `Bearer ${key}`;
+  try {
+    const res = await fetch(`${url}/rest/v1/rpc/${fn}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body || {}),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    return text ? JSON.parse(text) : true;
+  } catch (e) {
+    return null;
+  }
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(200).send("Bot is running");
+
+  // Only accept requests that really come from Telegram
+  const secret = process.env.WEBHOOK_SECRET;
+  const verified = Boolean(secret) && req.headers["x-telegram-bot-api-secret-token"] === secret;
+  if (secret && !verified) return res.status(401).send("unauthorized");
 
   const message = req.body && req.body.message;
   if (message && message.text) {
     const chatId = message.chat.id;
+    const from = message.from || {};
     const text = message.text;
-    const match = text.match(/0x[a-fA-F0-9]{40}/);
+    const evm = text.match(/0x[a-fA-F0-9]{40}/);
+    const sol = text.match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
+    const target = evm ? evm[0] : sol ? sol[0] : null;
+    const isAdmin =
+      verified && Boolean(process.env.ADMIN_ID) && String(from.id) === String(process.env.ADMIN_ID);
+
+    // Record the user (runs while we build the reply)
+    const tracking = from.id
+      ? db("track_user", {
+          p_id: from.id,
+          p_username: from.username || null,
+          p_first_name: from.first_name || null,
+          p_scan: Boolean(target) && !text.startsWith("/"),
+        })
+      : Promise.resolve(null);
 
     try {
-      if (text.startsWith("/start")) {
-        await send(chatId, "Welcome to Blockrugbot 🛡️\n\nSend me a token contract address (starts with 0x) and I'll scan it for rug-pull red flags: liquidity lock, ownership, holders and contract risks.\n\nSupports Ethereum, BSC, Base, Arbitrum and Polygon.");
-      } else if (match) {
-        await send(chatId, await checkToken(match[0]));
+      if (text.startsWith("/myid")) {
+        await send(chatId, `Your Telegram ID: ${from.id}`);
+      } else if (text.startsWith("/stats") && isAdmin) {
+        await tracking;
+        const s = await db("bot_stats");
+        if (!s) {
+          await send(chatId, "Stats unavailable. Check SUPABASE_URL and SUPABASE_SECRET_KEY in Vercel.");
+        } else {
+          await send(
+            chatId,
+            `📊 Blockrugbot stats\n\nTotal users: ${s.total_users}\nNew (24h): ${s.new_24h}\nActive (24h): ${s.active_24h}\nActive (7 days): ${s.active_7d}\nTotal scans: ${s.total_scans}`
+          );
+        }
+      } else if (text.startsWith("/start")) {
+        await send(chatId, "Welcome to Blockrugbot 🛡️\n\nSend me a token contract address and I'll scan it for rug-pull red flags: liquidity lock, ownership or authorities, holders and contract risks.\n\nSupports Ethereum, BSC, Base, Arbitrum, Polygon, Robinhood Chain and Solana.");
+      } else if (target) {
+        await send(chatId, await checkToken(target));
       } else {
-        await send(chatId, "Send me a token contract address (0x...) to check it.");
+        await send(chatId, "Send me a token contract address (0x... or a Solana address) to check it.");
       }
     } catch (err) {
       await send(chatId, "Something went wrong while checking that token. Please try again in a moment.");
     }
+    await tracking;
   }
   res.status(200).send("ok");
 };
