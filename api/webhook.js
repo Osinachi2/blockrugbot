@@ -259,7 +259,92 @@ module.exports = async (req, res) => {
         await send(chatId, "Send me a token contract address (0x... or a Solana address) to check it.");
       }
     } catch (err) {
+      await send(chatId, "Something went wrong while checking that token. Please try again in a moment.");// ---------- Database (Supabase) ----------
+async function db(fn, body) {
+  const url = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  const key = (process.env.SUPABASE_SECRET_KEY || "").trim();
+  if (!url) return { ok: false, error: "SUPABASE_URL is missing in Vercel." };
+  if (!key) return { ok: false, error: "SUPABASE_SECRET_KEY is missing in Vercel." };
+  if (key.startsWith("sb_publishable_")) {
+    return { ok: false, error: "SUPABASE_SECRET_KEY holds the publishable key. Use the key that starts with sb_secret_." };
+  }
+  const headers = { apikey: key, "Content-Type": "application/json" };
+  if (!key.startsWith("sb_")) headers.Authorization = `Bearer ${key}`;
+  try {
+    const res = await fetch(`${url}/rest/v1/rpc/${fn}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body || {}),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+    return { ok: true, data: text ? JSON.parse(text) : null };
+  } catch (e) {
+    return { ok: false, error: `Could not reach Supabase (${e.message}). Check SUPABASE_URL.` };
+  }
+}
+
+module.exports = async (req, res) => {
+  if (req.method !== "POST") return res.status(200).send("Bot is running");
+
+  // Only accept requests that really come from Telegram
+  const secret = process.env.WEBHOOK_SECRET;
+  const verified = Boolean(secret) && req.headers["x-telegram-bot-api-secret-token"] === secret;
+  if (secret && !verified) return res.status(401).send("unauthorized");
+
+  const message = req.body && req.body.message;
+  if (message && message.text) {
+    const chatId = message.chat.id;
+    const from = message.from || {};
+    const text = message.text;
+    const evm = text.match(/0x[a-fA-F0-9]{40}/);
+    const sol = text.match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
+    const target = evm ? evm[0] : sol ? sol[0] : null;
+    const isAdmin =
+      verified && Boolean(process.env.ADMIN_ID) && String(from.id) === String(process.env.ADMIN_ID);
+
+    // Record the user (runs while we build the reply)
+    const tracking = from.id
+      ? db("track_user", {
+          p_id: from.id,
+          p_username: from.username || null,
+          p_first_name: from.first_name || null,
+          p_scan: Boolean(target) && !text.startsWith("/"),
+        }).then((r) => {
+          if (!r.ok) console.error("track_user failed:", r.error);
+          return r;
+        })
+      : Promise.resolve(null);
+
+    try {
+      if (text.startsWith("/myid")) {
+        await send(chatId, `Your Telegram ID: ${from.id}`);
+      } else if (text.startsWith("/stats") && isAdmin) {
+        await tracking;
+        const r = await db("bot_stats");
+        if (!r.ok) {
+          await send(chatId, `Stats unavailable.\n${r.error}`);
+        } else {
+          const s = r.data;
+          await send(
+            chatId,
+            `📊 Blockrugbot stats\n\nTotal users: ${s.total_users}\nNew (24h): ${s.new_24h}\nActive (24h): ${s.active_24h}\nActive (7 days): ${s.active_7d}\nTotal scans: ${s.total_scans}`
+          );
+        }
+      } else if (text.startsWith("/start")) {
+        await send(chatId, "Welcome to Blockrugbot 🛡️\n\nSend me a token contract address and I'll scan it for rug-pull red flags: liquidity lock, ownership or authorities, holders and contract risks.\n\nSupports Ethereum, BSC, Base, Arbitrum, Polygon, Robinhood Chain and Solana.");
+      } else if (target) {
+        await send(chatId, await checkToken(target));
+      } else {
+        await send(chatId, "Send me a token contract address (0x... or a Solana address) to check it.");
+      }
+    } catch (err) {
       await send(chatId, "Something went wrong while checking that token. Please try again in a moment.");
+    }
+    await tracking;
+  }
+  res.status(200).send("ok");
+};
     }
     await tracking;
   }
