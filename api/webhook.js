@@ -344,7 +344,7 @@ module.exports = async (req, res) => {
           p_id: from.id,
           p_username: from.username || null,
           p_first_name: from.first_name || null,
-          p_scan: Boolean(target),
+          p_scan: Boolean(target) && cmd !== "/feedback",
         }).then((r) => {
           if (!r.ok) console.error("track_user failed:", r.error);
           return r;
@@ -369,9 +369,20 @@ module.exports = async (req, res) => {
       } else if (cmd === "/start") {
         await send(chatId, "Welcome to Blockrugbot 🛡️\n\nSend me a token contract address and I'll scan it for rug-pull red flags: liquidity lock, ownership or authorities, holders and contract risks.\n\nTap the Menu button or send /help to see everything I can do.");
       } else if (cmd === "/help") {
-        await send(chatId, "How to use Blockrugbot 🛡️\n\n1. Send a token contract address, or use /scan followed by the address.\n2. I check the liquidity lock, contract controls, holders and known scam patterns.\n3. You get a risk score from 0 to 100 and links to verify everything yourself.\n\nScore guide:\n🟢 0-29 lower risk\n🟠 30-59 medium risk\n🔴 60-100 high risk\n\nA low score does not mean a token is safe. This is not financial advice.\n\nCommands:\n/scan - scan a token\n/chains - supported blockchains\n/help - this message");
+        await send(chatId, "How to use Blockrugbot 🛡️\n\n1. Send a token contract address, or use /scan followed by the address.\n2. I check the liquidity lock, contract controls, holders and known scam patterns.\n3. You get a risk score from 0 to 100 and links to verify everything yourself.\n\nScore guide:\n🟢 0-29 lower risk\n🟠 30-59 medium risk\n🔴 60-100 high risk\n\nA low score does not mean a token is safe. This is not financial advice.\n\nCommands:\n/scan - scan a token\n/chains - supported blockchains\n/feedback - send us a suggestion or bug report\n/help - this message");
       } else if (cmd === "/chains") {
         await send(chatId, "Supported chains:\n\n• Ethereum\n• BNB Chain (BSC)\n• Base\n• Arbitrum\n• Polygon\n• Robinhood Chain\n• Solana\n\nSend any token address from these chains.");
+      } else if (cmd === "/feedback") {
+        const note = text.replace(/^\/feedback(@\w+)?\s*/i, "").trim().slice(0, 1000);
+        if (!note) {
+          await send(chatId, "Tell me what you think. Send your message after the command, for example:\n/feedback Please add Optimism support");
+        } else if (!process.env.ADMIN_ID) {
+          await send(chatId, "Feedback isn't available right now. Please try again later.");
+        } else {
+          const who = from.username ? `@${from.username}` : from.first_name || "unknown";
+          await send(process.env.ADMIN_ID, `📩 Feedback from ${who} (ID ${from.id}):\n\n${note}`);
+          await send(chatId, "Thanks! Your feedback was sent to the team 🙏");
+        }
       } else if (target) {
         await send(chatId, await checkToken(target));
       } else if (cmd === "/scan") {
