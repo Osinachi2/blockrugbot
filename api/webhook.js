@@ -11,17 +11,43 @@ const EXPLORERS = {
   robinhood: "https://robinhoodchain.blockscout.com",
 };
 
+// DexScreener chain name -> Uniswap interface chain name (fallback trade button)
+const UNISWAP_CHAINS = { ethereum: "ethereum", base: "base", arbitrum: "arbitrum", polygon: "polygon" };
+
+// Telegram trading bots. Your referral links come from Vercel environment variables.
+// "chains" = where each bot trades. Check each bot's own chain list and edit if needed.
+const TRADE_BOTS = [
+  { name: "Banana Gun", emoji: "🍌", env: "REF_BANANA", solEnv: "REF_BANANA_SOL", chains: ["ethereum", "base", "bsc", "robinhood", "solana"] },
+  { name: "Maestro", emoji: "🤖", env: "REF_MAESTRO", solEnv: "REF_MAESTRO_SOL", chains: ["ethereum", "base", "bsc", "arbitrum", "solana"] },
+  { name: "BasedBot", emoji: "🔵", env: "REF_BASED", solEnv: "REF_BASED_SOL", chains: ["ethereum", "base", "bsc", "arbitrum", "robinhood", "solana"] },
+];
+
+function botLink(bot, chain) {
+  const raw = chain === "solana" ? process.env[bot.solEnv] || process.env[bot.env] : process.env[bot.env];
+  const url = (raw || "").trim();
+  return url.startsWith("https://t.me/") ? url : null;
+}
+
 const BURN = [
   "0x000000000000000000000000000000000000dead",
   "0x0000000000000000000000000000000000000000",
   "1nc1nerator11111111111111111111111111111111",
 ];
 
-async function send(chatId, text) {
+const escapeHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+async function send(chatId, text, buttons, address) {
+  const payload = { chat_id: chatId, text, disable_web_page_preview: true };
+  if (address) {
+    // makes the token address tap-to-copy
+    payload.text = escapeHtml(text).replace("{{ADDR}}", `<code>${address}</code>`);
+    payload.parse_mode = "HTML";
+  }
+  if (buttons && buttons.length) payload.reply_markup = { inline_keyboard: buttons };
   await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -205,6 +231,51 @@ function scanSolana(sec, add) {
   return { lock, owner, holders, notes };
 }
 
+// ---------- Trade and chart buttons ----------
+function tradeButtons(pair, address, isEvm, score, blocked) {
+  const rows = [];
+  const chain = pair.chainId;
+  let hasBots = false;
+  let hasTrade = false;
+
+  if (!blocked) {
+    const prefix = score >= 60 ? "⚠️ " : "";
+
+    // 1. Telegram trading bots (with your referral links)
+    const botRow = [];
+    for (const bot of TRADE_BOTS) {
+      if (!bot.chains.includes(chain)) continue;
+      const url = botLink(bot, chain);
+      if (url) botRow.push({ text: `${prefix}${bot.emoji} ${bot.name}`, url });
+    }
+    if (botRow.length) {
+      rows.push(botRow);
+      hasBots = true;
+      hasTrade = true;
+    } else {
+      // 2. Fallback: the DEX's own website
+      let url = null;
+      let name = null;
+      if (!isEvm) {
+        url = `https://jup.ag/swap/SOL-${address}`;
+        name = "Jupiter";
+      } else if (chain === "bsc") {
+        url = `https://pancakeswap.finance/swap?chain=bsc&outputCurrency=${address}`;
+        name = "PancakeSwap";
+      } else if (UNISWAP_CHAINS[chain]) {
+        url = `https://app.uniswap.org/swap?chain=${UNISWAP_CHAINS[chain]}&outputCurrency=${address}`;
+        name = "Uniswap";
+      }
+      if (url) {
+        rows.push([{ text: score >= 60 ? `⚠️ Trade anyway on ${name} (high risk)` : `🔄 Trade on ${name}`, url }]);
+        hasTrade = true;
+      }
+    }
+  }
+  if (pair.url) rows.push([{ text: "📈 Chart on DexScreener", url: pair.url }]);
+  return { rows, hasBots, hasTrade };
+}
+
 async function checkToken(address) {
   const isEvm = address.startsWith("0x");
 
@@ -220,7 +291,11 @@ async function checkToken(address) {
   if (mine.length) pairs = mine;
 
   if (pairs.length === 0) {
-    return "I couldn't find this token on Ethereum, BSC, Base, Arbitrum, Polygon, Robinhood Chain or Solana. Check the address and try again.";
+    return {
+      text: "I couldn't find this token on Ethereum, BSC, Base, Arbitrum, Polygon, Robinhood Chain or Solana. Check the address and try again.",
+      buttons: [],
+      address: null,
+    };
   }
 
   pairs.sort((a, b) => ((b.liquidity && b.liquidity.usd) || 0) - ((a.liquidity && a.liquidity.usd) || 0));
@@ -261,7 +336,9 @@ async function checkToken(address) {
   }
 
   score = Math.min(score, 100);
+  const honeypot = flags.some((f) => f.startsWith("HONEYPOT"));
   const level = score >= 60 ? "🔴 HIGH RISK" : score >= 30 ? "🟠 MEDIUM RISK" : "🟢 LOWER RISK";
+  const trade = tradeButtons(pair, address, isEvm, score, honeypot);
 
   let msg = `🔎 ${symbol} on ${chainLabel}\n`;
   msg += `Price: $${pair.priceUsd || "n/a"}\n`;
@@ -271,6 +348,7 @@ async function checkToken(address) {
   msg += `\n${level} (${score}/100)\n`;
   msg += flags.length ? "⚠️ " + flags.join("\n⚠️ ") : "No major red flags found.";
   if (sections.notes.length) msg += "\n\n" + sections.notes.join("\n");
+  if (honeypot) msg += "\n\n🚫 Trade buttons hidden: this token was flagged as a honeypot.";
 
   msg += "\n\n🔗 VERIFY YOURSELF\n";
   if (isEvm) {
@@ -287,10 +365,15 @@ async function checkToken(address) {
     if (pair.pairAddress) msg += `Pool: https://solscan.io/account/${pair.pairAddress}\n`;
     msg += `Second opinion: https://rugcheck.xyz/tokens/${address}\n`;
   }
-  if (pair.url) msg += `Chart and liquidity: ${pair.url}\n`;
 
+  if (trade.hasBots) {
+    msg += "\n💱 TRADE IN TELEGRAM\nTap a bot below, then paste this token address:\n{{ADDR}}\n";
+    msg += "These are third-party bots: you create a wallet inside them, so only fund what you can afford to lose. The links may include our referral code, which supports Blockrugbot. We never handle your funds.\n";
+  } else if (trade.hasTrade) {
+    msg += "\nTrade buttons open the DEX's own website. Blockrugbot never handles your funds.\n";
+  }
   msg += "\nAutomated check, not financial advice. A low score does not mean a token is safe.";
-  return msg;
+  return { text: msg, buttons: trade.rows, address: trade.hasBots ? address : null };
 }
 
 // ---------- Database (Supabase) ----------
@@ -366,10 +449,15 @@ module.exports = async (req, res) => {
             `📊 Blockrugbot stats\n\nTotal users: ${s.total_users}\nNew (24h): ${s.new_24h}\nActive (24h): ${s.active_24h}\nActive (7 days): ${s.active_7d}\nTotal scans: ${s.total_scans}`
           );
         }
+      } else if (cmd === "/refcheck" && isAdmin) {
+        const lines = TRADE_BOTS.map(
+          (b) => `${b.emoji} ${b.name}: ${botLink(b, "ethereum") ? "set ✅" : "missing ❌"} (separate Solana link: ${process.env[b.solEnv] ? "set ✅" : "not set"})`
+        );
+        await send(chatId, "Referral links in Vercel:\n\n" + lines.join("\n"));
       } else if (cmd === "/start") {
         await send(chatId, "Welcome to Blockrugbot 🛡️\n\nSend me a token contract address and I'll scan it for rug-pull red flags: liquidity lock, ownership or authorities, holders and contract risks.\n\nTap the Menu button or send /help to see everything I can do.");
       } else if (cmd === "/help") {
-        await send(chatId, "How to use Blockrugbot 🛡️\n\n1. Send a token contract address, or use /scan followed by the address.\n2. I check the liquidity lock, contract controls, holders and known scam patterns.\n3. You get a risk score from 0 to 100 and links to verify everything yourself.\n\nScore guide:\n🟢 0-29 lower risk\n🟠 30-59 medium risk\n🔴 60-100 high risk\n\nA low score does not mean a token is safe. This is not financial advice.\n\nCommands:\n/scan - scan a token\n/chains - supported blockchains\n/feedback - send us a suggestion or bug report\n/help - this message");
+        await send(chatId, "How to use Blockrugbot 🛡️\n\n1. Send a token contract address, or use /scan followed by the address.\n2. I check the liquidity lock, contract controls, holders and known scam patterns.\n3. You get a risk score from 0 to 100, links to verify everything yourself, and buttons to trade in Telegram.\n\nScore guide:\n🟢 0-29 lower risk\n🟠 30-59 medium risk\n🔴 60-100 high risk\n\nA low score does not mean a token is safe. This is not financial advice. Trade buttons open third-party bots and may include our referral code.\n\nCommands:\n/scan - scan a token\n/chains - supported blockchains\n/feedback - send us a suggestion or bug report\n/help - this message");
       } else if (cmd === "/chains") {
         await send(chatId, "Supported chains:\n\n• Ethereum\n• BNB Chain (BSC)\n• Base\n• Arbitrum\n• Polygon\n• Robinhood Chain\n• Solana\n\nSend any token address from these chains.");
       } else if (cmd === "/feedback") {
@@ -384,7 +472,8 @@ module.exports = async (req, res) => {
           await send(chatId, "Thanks! Your feedback was sent to the team 🙏");
         }
       } else if (target) {
-        await send(chatId, await checkToken(target));
+        const result = await checkToken(target);
+        await send(chatId, result.text, result.buttons, result.address);
       } else if (cmd === "/scan") {
         await send(chatId, "Send the command with a token address, for example:\n/scan 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
       } else {
